@@ -1,0 +1,182 @@
+name: Build TrafficMonitor
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-2022
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download TrafficMonitor V1.85.1 Source
+        shell: powershell
+        run: |
+          Write-Host "Downloading TrafficMonitor source..."
+          Invoke-WebRequest `
+            -Uri "https://github.com/zhongyang219/TrafficMonitor/archive/refs/tags/V1.85.1.zip" `
+            -OutFile "TrafficMonitor_Source.zip"
+          Expand-Archive "TrafficMonitor_Source.zip" -DestinationPath "source"
+
+      - name: Download Official TrafficMonitor V1.85.1 x64
+        shell: powershell
+        run: |
+          Write-Host "Downloading official TrafficMonitor V1.85.1 x64..."
+          Invoke-WebRequest `
+            -Uri "https://github.com/zhongyang219/TrafficMonitor/releases/download/V1.85.1/TrafficMonitor_V1.85.1_x64.zip" `
+            -OutFile "TrafficMonitor_Official_x64.zip"
+          Expand-Archive "TrafficMonitor_Official_x64.zip" -DestinationPath "official"
+
+      - name: Locate solution
+        shell: powershell
+        run: |
+          $sln = Get-ChildItem -Path "$PWD\source" -Filter "TrafficMonitor.sln" -Recurse | Select-Object -First 1
+          if (-not $sln) { throw "TrafficMonitor.sln not found." }
+          "SOLUTION_PATH=$($sln.FullName)" | Out-File $env:GITHUB_ENV -Append
+
+      - name: Inject Pin Tooltip Window Feature (C++ Auto-Patch)
+        shell: powershell
+        run: |
+          Write-Host "Mulai menyuntikkan fitur Pin Tooltip ke source code C++..."
+          
+          # 1. Cari folder utama TrafficMonitor
+          $tmFolder = Get-ChildItem -Path "$PWD\source" -Directory -Recurse | Where-Object { $_.Name -eq "TrafficMonitor" } | Select-Object -First 1
+          if (-not $tmFolder) { throw "Folder utama TrafficMonitor tidak ditemukan." }
+          $tmPath = $tmFolder.FullName
+
+          # 2. Patch file Resource.h untuk membuat ID Menu baru
+          $resourceFile = Join-Path $tmPath "Resource.h"
+          if (Test-Path $resourceFile) {
+              $content = Get-Content $resourceFile -Raw
+              if ($content -notmatch "ID_MENU_PIN_TOOLTIP") {
+                  $content += "`r`n#define ID_MENU_PIN_TOOLTIP                     51001`r`n"
+                  Set-Content $resourceFile $content
+                  Write-Host "-> Resource.h berhasil ditambahkan ID Menu baru."
+              }
+          }
+
+          # 3. Patch file TrafficMonitorDlg.h (Header Jendela Utama)
+          $dlgHeaderFile = Join-Path $tmPath "TrafficMonitorDlg.h"
+          if (Test-Path $dlgHeaderFile) {
+              $content = Get-Content $dlgHeaderFile -Raw
+              if ($content -notmatch "m_bPinTooltipMode") {
+                  # Menyisipkan variabel status Pin Mode di dalam kelas CTrafficMonitorDlg
+                  $content = $content -replace "bool m_bShowNotifyIcon", "bool m_bPinTooltipMode = false;`r`n`tbool m_bShowNotifyIcon"
+                  # Menyisipkan deklarasi fungsi menu klik kanan baru
+                  $content = $content -replace "afx_msg void OnClose\(\);", "afx_msg void OnClose();`r`n`tafx_msg void OnMenuPinTooltip();`r`n`tafx_msg void OnUpdateMenuPinTooltip(CCmdUI* pCmdUI);"
+                  Set-Content $dlgHeaderFile $content
+                  Write-Host "-> TrafficMonitorDlg.h berhasil dipatch."
+              }
+          }
+
+          # 4. Patch file TrafficMonitorDlg.cpp (Logika dan Tampilan)
+          $dlgCppFile = Join-Path $tmPath "TrafficMonitorDlg.cpp"
+          if (Test-Path $dlgCppFile) {
+              $content = Get-Content $dlgCppFile -Raw
+              
+              # Hubungkan ID Menu dengan fungsinya (Message Map)
+              if ($content -notmatch "ID_MENU_PIN_TOOLTIP") {
+                  $msgMapPlacement = "ON_WM_CLOSE\(\)"
+                  $newMap = "ON_WM_CLOSE()`r`n`tON_COMMAND(ID_MENU_PIN_TOOLTIP, &CTrafficMonitorDlg::OnMenuPinTooltip)`r`n`tON_UPDATE_COMMAND_UI(ID_MENU_PIN_TOOLTIP, &CTrafficMonitorDlg::OnUpdateMenuPinTooltip)"
+                  $content = $content -replace $msgMapPlacement, $newMap
+
+                  # Tambahkan pilihan menu "Pin Tooltip Window" ke menu klik kanan utama
+                  $menuPlacement = "pContextMenu->AppendMenu\(MF_STRING, ID_SHOW_MAIN_WINDOW"
+                  $newMenu = "pContextMenu->AppendMenu(MF_STRING, ID_MENU_PIN_TOOLTIP, _T(\"Pin Tooltip Window\"));`r`n`t`tpContextMenu->AppendMenu(MF_STRING, ID_SHOW_MAIN_WINDOW"
+                  $content = $content -replace $menuPlacement, $newMenu
+
+                  # Mengubah fungsi gambar Jendela Utama agar berubah wujud jadi Tooltip jika Mode Pin Aktif
+                  $paintOld = "void CTrafficMonitorDlg::OnPaint\(\)\s*\{"
+                  $paintNew = "void CTrafficMonitorDlg::OnPaint()`r`n{`r`n`tif (m_bPinTooltipMode)`r`n`t{`r`n`t`tCPaintDC dc(this);`r`n`t`tCRect rect;`r`n`t`tGetClientRect(&rect);`r`n`t`tcdib.Draw(dc, rect);`r`n`t`t`r`n`t`tCFont* pOldFont = dc.SelectObject(&m_font);`r`n`t`tdc.SetTextColor(m_data.m_text_color);`r`n`t`tdc.SetBkMode(TRANSPARENT);`r`n`t`t`r`n`t`tCString strTooltip = m_data.GetTooltipString();`r`n`t`trect.DeflateRect(5, 5);`r`n`t`tdc.DrawText(strTooltip, rect, DT_LEFT | DT_TOP);`r`n`t`t`r`n`t`tdc.SelectObject(pOldFont);`r`n`t`treturn;`r`n`t}`r`n"
+                  $content = $content -replace $paintOld, $paintNew
+
+                  # Tempel kode logika fungsi Menu Klik Kanan di bagian paling bawah file
+                  $functionsCode = @"
+
+void CTrafficMonitorDlg::OnMenuPinTooltip()
+{
+    m_bPinTooltipMode = !m_bPinTooltipMode;
+    if (m_bPinTooltipMode)
+    {
+        // Ubah ukuran jendela utama menjadi kotak memanjang vertikal menyerupai tooltip asli
+        SetWindowPos(NULL, 0, 0, 240, 95, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+    else
+    {
+        // Kembalikan ke ukuran standar window floating TrafficMonitor asli
+        SetWindowPos(NULL, 0, 0, m_data.m_window_width, m_data.m_window_height, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+    Invalidate();
+}
+
+void CTrafficMonitorDlg::OnUpdateMenuPinTooltip(CCmdUI* pCmdUI)
+{
+    if (pCmdUI != NULL)
+    {
+        pCmdUI->SetCheck(m_bPinTooltipMode);
+    }
+}
+"@
+                  $content += $functionsCode
+                  Set-Content $dlgCppFile $content
+                  Write-Host "-> TrafficMonitorDlg.cpp berhasil disuntik logika fitur baru."
+              }
+          }
+
+      - name: Patch TrafficMonitor linker
+        shell: powershell
+        run: |
+          $project = Get-ChildItem -Path "$PWD\source" -Filter "TrafficMonitor.vcxproj" -Recurse | Select-Object -First 1
+          if (-not $project) { throw "TrafficMonitor.vcxproj not found." }
+          [xml]$xml = Get-Content $project.FullName
+          $ns = New-Object System.Xml.XmlNamespaceManager($xml.NameTable)
+          $ns.AddNamespace("msbuild", "http://schemas.microsoft.com/developer/msbuild/2003")
+          $linkerNodes = $xml.SelectNodes("//msbuild:Link/AdditionalDependencies", $ns)
+          if ($linkerNodes.Count -eq 0) { $linkerNodes = $xml.SelectNodes("//msbuild:AdditionalDependencies", $ns) }
+          foreach ($node in $linkerNodes) {
+            if ($node.InnerText -notmatch "runtimeobject\.lib") { $node.InnerText = "runtimeobject.lib;" + $node.InnerText }
+          }
+          $xml.Save($project.FullName)
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v3
+
+      - name: Build TrafficMonitor x64 Release
+        shell: powershell
+        run: |
+          msbuild "$env:SOLUTION_PATH" `
+            /m `
+            /p:Configuration=Release `
+            /p:Platform=x64 `
+            /v:m
+
+      - name: Locate Built TrafficMonitor
+        shell: powershell
+        run: |
+          $exe = Get-ChildItem -Path "$PWD\source" -Filter "TrafficMonitor.exe" -Recurse | Where-Object { $_.FullName -match "\\Bin\\x64\\Release\\" } | Select-Object -First 1
+          if (-not $exe) { throw "Built TrafficMonitor.exe not found." }
+          "BUILT_EXE=$($exe.FullName)" | Out-File $env:GITHUB_ENV -Append
+          "BUILD_DIR=$($exe.Directory.FullName)" | Out-File $env:GITHUB_ENV -Append
+
+      - name: Prepare Final Package
+        shell: powershell
+        run: |
+          New-Item -ItemType Directory -Force -Path "package\TrafficMonitor" | Out-Null
+          Copy-Item -Path "$env:BUILD_DIR\*" -Destination "package\TrafficMonitor" -Recurse -Force
+          $officialExe = Get-ChildItem -Path "$PWD\official" -Filter "TrafficMonitor.exe" -Recurse | Select-Object -First 1
+          $officialDir = $officialExe.Directory.FullName
+          Get-ChildItem -Path $officialDir -File | Where-Object { $_.Name -ne "TrafficMonitor.exe" } | ForEach-Object { Copy-Item $_.FullName "package\TrafficMonitor\$($_.Name)" -Force }
+          Get-ChildItem -Path $officialDir -Directory | ForEach-Object { Copy-Item $_.FullName "package\TrafficMonitor\$($_.Name)" -Recurse -Force }
+
+      - name: Package ZIP
+        shell: powershell
+        run: |
+          Compress-Archive -Path "package\TrafficMonitor" -DestinationPath "TrafficMonitor_V1.85.1_x64.zip" -Force
+
+      - name: Upload ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: TrafficMonitor-V1.85.1-x64
+          path: TrafficMonitor_V1.85.1_x64.zip
