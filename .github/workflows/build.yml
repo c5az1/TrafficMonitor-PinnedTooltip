@@ -54,7 +54,458 @@ jobs:
           "SOLUTION_PATH=$($sln.FullName)" |
             Out-File $env:GITHUB_ENV -Append
 
-      - name: Patch Linker
+      - name: Add Permanent Tooltip Graph
+        shell: powershell
+        run: |
+          $tm = Get-ChildItem `
+            -Path "$PWD\source" `
+            -Directory `
+            -Recurse |
+            Where-Object { $_.Name -eq "TrafficMonitor" } |
+            Select-Object -First 1
+
+          if (-not $tm) {
+            throw "TrafficMonitor source folder not found."
+          }
+
+          $tmPath = $tm.FullName
+          $header = Join-Path $tmPath "TrafficMonitorDlg.h"
+          $cpp = Join-Path $tmPath "TrafficMonitorDlg.cpp"
+
+          if (-not (Test-Path $header)) {
+            throw "TrafficMonitorDlg.h not found."
+          }
+
+          if (-not (Test-Path $cpp)) {
+            throw "TrafficMonitorDlg.cpp not found."
+          }
+
+          $h = Get-Content $header -Raw
+          $c = Get-Content $cpp -Raw
+
+          if ($h -notmatch "TM_PERMANENT_TOOLTIP_ID") {
+
+            $h = $h -replace `
+              '(#pragma once\s*)', `
+              '$1`r`n#define TM_PERMANENT_TOOLTIP_ID 51001`r`n'
+
+            $handlerDecl = 'afx_msg void OnPermanentTooltipGraph();'
+
+            if ($h -match 'afx_msg void OnClose\(\);') {
+              $h = $h -replace `
+                'afx_msg void OnClose\(\);', `
+                "afx_msg void OnClose();`r`n`t$handlerDecl"
+            }
+            elseif ($h -match 'DECLARE_MESSAGE_MAP\(\)') {
+              $h = $h -replace `
+                'DECLARE_MESSAGE_MAP\(\)', `
+                "$handlerDecl`r`n`r`n`tDECLARE_MESSAGE_MAP()"
+            }
+            else {
+              throw "Could not find a suitable place for message declaration."
+            }
+
+            Set-Content $header $h -Encoding UTF8
+
+            $class = @'
+#include <iphlpapi.h>
+#pragma comment(lib, "iphlpapi.lib")
+
+class CTPinnedGraphWnd : public CWnd
+{
+public:
+    CTPinnedGraphWnd()
+        : m_lastTick(0), m_lastRx(0), m_lastTx(0),
+          m_rxRate(0.0), m_txRate(0.0) {}
+
+    BOOL Create(CWnd* owner)
+    {
+        CString cls = AfxRegisterWndClass(
+            CS_HREDRAW | CS_VREDRAW,
+            ::LoadCursor(nullptr, IDC_ARROW),
+            nullptr,
+            nullptr);
+
+        return CWnd::CreateEx(
+            WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
+            cls,
+            _T("TrafficMonitor - Permanent Tooltip"),
+            WS_POPUP | WS_THICKFRAME | WS_SYSMENU,
+            CRect(100, 100, 620, 440),
+            owner,
+            0);
+    }
+
+    void Start()
+    {
+        UpdateCounters();
+        SetTimer(1, 500, nullptr);
+    }
+
+protected:
+    ULONGLONG m_lastTick;
+    ULONGLONG m_lastRx;
+    ULONGLONG m_lastTx;
+    double m_rxRate;
+    double m_txRate;
+    std::vector<double> m_rx;
+    std::vector<double> m_tx;
+
+    void UpdateCounters()
+    {
+        MIB_IF_TABLE2* table = nullptr;
+
+        if (GetIfTable2(&table) != NO_ERROR || table == nullptr)
+            return;
+
+        ULONGLONG rx = 0;
+        ULONGLONG tx = 0;
+
+        for (ULONG i = 0; i < table->NumEntries; ++i)
+        {
+            const MIB_IF_ROW2& row = table->Table[i];
+
+            if (row.OperStatus == IfOperStatusUp)
+            {
+                rx += row.InOctets;
+                tx += row.OutOctets;
+            }
+        }
+
+        FreeMibTable(table);
+
+        ULONGLONG now = GetTickCount64();
+
+        if (m_lastTick != 0 && now > m_lastTick)
+        {
+            double seconds =
+                (double)(now - m_lastTick) / 1000.0;
+
+            if (seconds > 0.0)
+            {
+                m_rxRate =
+                    (double)(rx - m_lastRx) / seconds;
+
+                m_txRate =
+                    (double)(tx - m_lastTx) / seconds;
+
+                if (m_rxRate < 0) m_rxRate = 0;
+                if (m_txRate < 0) m_txRate = 0;
+
+                m_rx.push_back(m_rxRate);
+                m_tx.push_back(m_txRate);
+
+                const size_t maxSamples = 60;
+
+                while (m_rx.size() > maxSamples)
+                    m_rx.erase(m_rx.begin());
+
+                while (m_tx.size() > maxSamples)
+                    m_tx.erase(m_tx.begin());
+            }
+        }
+
+        m_lastRx = rx;
+        m_lastTx = tx;
+        m_lastTick = now;
+    }
+
+    static CString FormatRate(double bytes)
+    {
+        CString s;
+
+        if (bytes >= 1024.0 * 1024.0)
+            s.Format(_T("%.2f MB/s"),
+                bytes / (1024.0 * 1024.0));
+        else
+            s.Format(_T("%.1f KB/s"),
+                bytes / 1024.0);
+
+        return s;
+    }
+
+    afx_msg void OnTimer(UINT_PTR id)
+    {
+        if (id == 1)
+        {
+            UpdateCounters();
+            Invalidate(FALSE);
+        }
+
+        CWnd::OnTimer(id);
+    }
+
+    afx_msg BOOL OnEraseBkgnd(CDC*)
+    {
+        return TRUE;
+    }
+
+    afx_msg void OnLButtonDown(UINT flags, CPoint point)
+    {
+        ReleaseCapture();
+        SendMessage(
+            WM_NCLBUTTONDOWN,
+            HTCAPTION,
+            MAKELPARAM(point.x, point.y));
+
+        CWnd::OnLButtonDown(flags, point);
+    }
+
+    afx_msg void OnClose()
+    {
+        KillTimer(1);
+        ShowWindow(SW_HIDE);
+    }
+
+    afx_msg void OnPaint()
+    {
+        CPaintDC dc(this);
+
+        CRect rc;
+        GetClientRect(&rc);
+
+        dc.FillSolidRect(&rc, RGB(29, 29, 29));
+        dc.Draw3dRect(
+            &rc,
+            RGB(75, 75, 75),
+            RGB(10, 10, 10));
+
+        dc.SetBkMode(TRANSPARENT);
+
+        CFont font;
+        font.CreatePointFont(90, _T("Segoe UI"));
+        CFont* old = dc.SelectObject(&font);
+
+        dc.SetTextColor(RGB(90, 190, 255));
+
+        CString rxText =
+            _T("Download: ") + FormatRate(m_rxRate);
+
+        dc.TextOut(14, 10, rxText);
+
+        dc.SetTextColor(RGB(100, 225, 130));
+
+        CString txText =
+            _T("Upload: ") + FormatRate(m_txRate);
+
+        dc.TextOut(270, 10, txText);
+
+        CRect graph(
+            14,
+            42,
+            rc.Width() - 14,
+            rc.Height() - 24);
+
+        dc.FillSolidRect(
+            &graph,
+            RGB(20, 20, 20));
+
+        dc.Draw3dRect(
+            &graph,
+            RGB(55, 55, 55),
+            RGB(8, 8, 8));
+
+        double maxValue = 1024.0;
+
+        for (double v : m_rx)
+            if (v > maxValue) maxValue = v;
+
+        for (double v : m_tx)
+            if (v > maxValue) maxValue = v;
+
+        maxValue *= 1.15;
+
+        const int samples =
+            (int)max(m_rx.size(), m_tx.size());
+
+        if (samples > 1)
+        {
+            const double step =
+                (double)graph.Width() /
+                60.0;
+
+            CBrush rxBrush(
+                RGB(55, 165, 235));
+
+            CBrush txBrush(
+                RGB(75, 205, 115));
+
+            int rxCount = (int)m_rx.size();
+            int txCount = (int)m_tx.size();
+
+            int first =
+                max(0, samples - 60);
+
+            for (int i = first; i < samples; ++i)
+            {
+                int x =
+                    graph.left +
+                    (int)((i - first) * step);
+
+                int bar =
+                    max(2, (int)(step / 2.0) - 1);
+
+                double rv =
+                    i < rxCount ? m_rx[i] : 0.0;
+
+                double tv =
+                    i < txCount ? m_tx[i] : 0.0;
+
+                int rh =
+                    (int)(
+                        rv / maxValue *
+                        (graph.Height() - 8));
+
+                int th =
+                    (int)(
+                        tv / maxValue *
+                        (graph.Height() - 8));
+
+                if (rh > 0)
+                {
+                    CRect r(
+                        x,
+                        graph.bottom - rh,
+                        x + bar,
+                        graph.bottom);
+
+                    dc.FillRect(&r, &rxBrush);
+                }
+
+                if (th > 0)
+                {
+                    CRect r(
+                        x + bar + 1,
+                        graph.bottom - th,
+                        x + bar * 2 + 1,
+                        graph.bottom);
+
+                    dc.FillRect(&r, &txBrush);
+                }
+            }
+        }
+
+        dc.SelectObject(old);
+    }
+
+    DECLARE_MESSAGE_MAP()
+};
+
+BEGIN_MESSAGE_MAP(CTPinnedGraphWnd, CWnd)
+    ON_WM_PAINT()
+    ON_WM_TIMER()
+    ON_WM_ERASEBKGND()
+    ON_WM_LBUTTONDOWN()
+    ON_WM_CLOSE()
+END_MESSAGE_MAP()
+
+static CTPinnedGraphWnd* g_tmPinnedGraph = nullptr;
+
+'@
+
+            # Put the helper class after the include section and before
+            # the first implementation. This avoids touching the existing
+            # TrafficMonitor data/paint code.
+            $insertAt = $c.IndexOf("IMPLEMENT_DYNAMIC")
+
+            if ($insertAt -lt 0) {
+              $insertAt = 0
+            }
+
+            $c =
+              $c.Substring(0, $insertAt) +
+              $class +
+              "`r`n" +
+              $c.Substring($insertAt)
+
+            # Add command to the existing message map.
+            $mapStart = $c.IndexOf("BEGIN_MESSAGE_MAP(CTrafficMonitorDlg")
+
+            if ($mapStart -lt 0) {
+              throw "CTrafficMonitorDlg message map not found."
+            }
+
+            $mapEnd = $c.IndexOf("`n", $mapStart)
+
+            if ($mapEnd -lt 0) {
+              throw "Could not locate message map line."
+            }
+
+            $entry =
+              "`r`n`tON_COMMAND(TM_PERMANENT_TOOLTIP_ID, &CTrafficMonitorDlg::OnPermanentTooltipGraph)"
+
+            $c =
+              $c.Substring(0, $mapEnd + 1) +
+              $entry +
+              $c.Substring($mapEnd + 1)
+
+            # Add menu item immediately before TrackPopupMenu.
+            $popup = $c.IndexOf("TrackPopupMenu")
+
+            if ($popup -lt 0) {
+              throw "TrackPopupMenu was not found."
+            }
+
+            $menu = @'
+            pContextMenu->AppendMenu(
+                MF_STRING,
+                TM_PERMANENT_TOOLTIP_ID,
+                _T("Permanent Tooltip + Graphic"));
+
+'@
+
+            $c =
+              $c.Substring(0, $popup) +
+              $menu +
+              $c.Substring($popup)
+
+            # Add handler at end.
+            $handler = @'
+
+void CTrafficMonitorDlg::OnPermanentTooltipGraph()
+{
+    if (g_tmPinnedGraph == nullptr)
+    {
+        g_tmPinnedGraph =
+            new CTPinnedGraphWnd();
+
+        if (!g_tmPinnedGraph->Create(this))
+        {
+            delete g_tmPinnedGraph;
+            g_tmPinnedGraph = nullptr;
+            return;
+        }
+
+        CRect r;
+        GetWindowRect(&r);
+
+        g_tmPinnedGraph->SetWindowPos(
+            &wndTopMost,
+            r.left,
+            r.bottom + 8,
+            600,
+            400,
+            SWP_SHOWWINDOW);
+
+        g_tmPinnedGraph->Start();
+    }
+    else
+    {
+        if (g_tmPinnedGraph->IsWindowVisible())
+            g_tmPinnedGraph->ShowWindow(SW_HIDE);
+        else
+            g_tmPinnedGraph->ShowWindow(SW_SHOW);
+    }
+}
+
+'@
+
+            $c += $handler
+
+            Set-Content $cpp $c -Encoding UTF8
+          }
+
+      - name: Patch TrafficMonitor Linker
         shell: powershell
         run: |
           $project = Get-ChildItem `
@@ -95,11 +546,16 @@ jobs:
               $node.InnerText =
                 "runtimeobject.lib;" + $node.InnerText
             }
+
+            if ($node.InnerText -notmatch "iphlpapi\.lib") {
+              $node.InnerText =
+                "iphlpapi.lib;" + $node.InnerText
+            }
           }
 
           $xml.Save($project.FullName)
 
-          Write-Host "runtimeobject.lib added."
+          Write-Host "runtimeobject.lib and iphlpapi.lib added."
 
       - name: Setup MSBuild
         uses: microsoft/setup-msbuild@v3
@@ -194,11 +650,11 @@ jobs:
         run: |
           Compress-Archive `
             -Path "package\TrafficMonitor" `
-            -DestinationPath "TrafficMonitor_V1.85.1_x64.zip" `
+            -DestinationPath "TrafficMonitor_V1.85.1_PermanentTooltip_Mode4_x64.zip" `
             -Force
 
       - name: Upload ZIP
         uses: actions/upload-artifact@v4
         with:
-          name: TrafficMonitor-V1.85.1-x64
-          path: TrafficMonitor_V1.85.1_x64.zip
+          name: TrafficMonitor-V1.85.1-PermanentTooltip-Mode4-x64
+          path: TrafficMonitor_V1.85.1_PermanentTooltip_Mode4_x64.zip
